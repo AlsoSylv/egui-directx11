@@ -32,6 +32,7 @@ pub struct TexturePool {
     device: ID3D11Device,
     pool: HashMap<u64, Texture>,
     native_pool: HashMap<u64, ID3D11Texture2D>,
+    next_native_idx: u64,
 }
 
 impl TexturePool {
@@ -40,6 +41,7 @@ impl TexturePool {
             device: device.clone(),
             pool: HashMap::new(),
             native_pool: HashMap::new(),
+            next_native_idx: 0,
         }
     }
 
@@ -115,7 +117,8 @@ impl TexturePool {
         &mut self,
         texture: ID3D11Texture2D,
     ) -> TextureId {
-        let id = self.native_pool.len() as u64;
+        let id = self.next_native_idx;
+        self.next_native_idx += 1;
         self.native_pool.insert(id, texture);
         TextureId::User(id)
     }
