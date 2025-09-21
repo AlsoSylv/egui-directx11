@@ -13,11 +13,7 @@ use std::{collections::HashMap, mem, slice};
 use egui::{Color32, ImageData, TextureId, TexturesDelta};
 
 use windows::{
-    Win32::Graphics::{
-        Direct3D::{D3D_SRV_DIMENSION, D3D11_SRV_DIMENSION_TEXTURE2D},
-        Direct3D11::*,
-        Dxgi::Common::*,
-    },
+    Win32::Graphics::{Direct3D11::*, Dxgi::Common::*},
     core::Result,
 };
 
@@ -31,7 +27,7 @@ struct Texture {
 pub struct TexturePool {
     device: ID3D11Device,
     pool: HashMap<u64, Texture>,
-    native_pool: HashMap<u64, ID3D11Texture2D>,
+    native_pool: HashMap<u64, (ID3D11Texture2D, ID3D11ShaderResourceView)>,
     next_native_idx: u64,
 }
 
@@ -51,28 +47,8 @@ impl TexturePool {
                 self.pool.get(&tid).map(|t| t.srv.clone())
             },
             TextureId::User(tid) => {
-                let tex = self.native_pool.get(&tid)?;
-                let mut srv = None;
-                unsafe {
-                    self.device.CreateShaderResourceView(
-                        tex,
-                        Some(&D3D11_SHADER_RESOURCE_VIEW_DESC {
-                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                            ViewDimension: D3D_SRV_DIMENSION {
-                                0: D3D11_SRV_DIMENSION_TEXTURE2D.0,
-                            },
-                            Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
-                                Texture2D: D3D11_TEX2D_SRV {
-                                    MipLevels: 1,
-                                    MostDetailedMip: 0,
-                                },
-                            },
-                        }),
-                        Some(&mut srv),
-                    )
-                }
-                .unwrap();
-                srv
+                let (_, shader_view) = self.native_pool.get(&tid)?;
+                Some(shader_view.clone())
             },
         }
     }
@@ -119,7 +95,13 @@ impl TexturePool {
     ) -> TextureId {
         let id = self.next_native_idx;
         self.next_native_idx += 1;
-        self.native_pool.insert(id, texture);
+        let mut srv = None;
+        unsafe {
+            self.device
+                .CreateShaderResourceView(&texture, None, Some(&mut srv))
+        }
+        .unwrap();
+        self.native_pool.insert(id, (texture, srv.unwrap()));
         TextureId::User(id)
     }
 
@@ -131,7 +113,9 @@ impl TexturePool {
             TextureId::Managed(_) => {
                 panic!("Cannot manually remove managed textures")
             },
-            TextureId::User(tid) => self.native_pool.remove(tid),
+            TextureId::User(tid) => {
+                self.native_pool.remove(tid).map(|(tex, _)| tex)
+            },
         }
     }
 
@@ -195,7 +179,7 @@ impl TexturePool {
             Height: data.height() as _,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
