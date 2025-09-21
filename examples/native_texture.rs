@@ -1,7 +1,8 @@
-use std::{env, ptr};
+use std::{io::BufReader, ptr};
 
 use egui::*;
 
+use jpeg_decoder::Decoder;
 use windows::Win32::{
     Foundation::{HMODULE, HWND},
     Graphics::{
@@ -27,50 +28,6 @@ fn main() {
     );
 }
 
-#[derive(Default)]
-struct DemoState {
-    egui_demo: egui_demo_lib::DemoWindows,
-    egui_color_test: egui_demo_lib::ColorTest,
-}
-
-impl DemoState {
-    fn ui(&mut self, ctx: &egui::Context) {
-        let args = env::args().skip(1).collect::<Vec<_>>();
-        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-        match &args[..] {
-            [] => self.egui_demo.ui(ctx),
-            ["color-test"] => self.color_test(ctx),
-            _ => panic!("Unknown arguments: {:?}", args),
-        }
-    }
-
-    fn color_test(&mut self, ctx: &egui::Context) {
-        use egui::Window;
-
-        const WINDOW_WIDTH: f32 = 640.0;
-
-        let screen_rect = ctx.input(|input| input.screen_rect);
-        let window_height = screen_rect.height() - 60.0;
-
-        Window::new("Color Test")
-            .resizable(false)
-            .collapsible(false)
-            .pivot(Align2::CENTER_CENTER)
-            .fixed_pos(screen_rect.center())
-            .default_width(WINDOW_WIDTH)
-            .min_width(WINDOW_WIDTH)
-            .max_width(WINDOW_WIDTH)
-            .default_height(window_height)
-            .min_height(window_height)
-            .max_height(window_height)
-            .show(ctx, |ui| {
-                println!("{:?}", ui.available_size());
-                ScrollArea::vertical()
-                    .show(ui, |ui| self.egui_color_test.ui(ui))
-            });
-    }
-}
-
 struct DemoApp {
     device: ID3D11Device,
     device_context: ID3D11DeviceContext,
@@ -79,12 +36,13 @@ struct DemoApp {
     egui_ctx: egui::Context,
     egui_renderer: egui_directx11::Renderer,
     egui_winit: egui_winit::State,
-    state: DemoState,
+    tex: TextureId,
 }
 
 trait App: Sized {
     fn on_event(&mut self, window: &Window, event: &WindowEvent);
     fn new(window: &Window) -> Self;
+    fn on_exit(&mut self);
 }
 
 impl App for DemoApp {
@@ -115,7 +73,7 @@ impl App for DemoApp {
         );
 
         let egui_ctx = egui::Context::default();
-        let egui_renderer = egui_directx11::Renderer::new(&device)
+        let mut egui_renderer = egui_directx11::Renderer::new(&device)
             .expect("Failed to create egui renderer");
         let egui_winit = egui_winit::State::new(
             egui_ctx.clone(),
@@ -126,6 +84,50 @@ impl App for DemoApp {
             None,
         );
 
+        // Image source: https://www.publicdomainpictures.net/en/view-image.php?image=308608
+        let bytes =
+            Decoder::new(BufReader::new(&include_bytes!("./1080p.jpg")[..]))
+                .decode()
+                .unwrap();
+        let bytes = Vec::from_iter(bytes.chunks_exact(3).map(|slice| {
+            u32::from_le_bytes([slice[0], slice[1], slice[2], 0])
+        }));
+
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: 1920 as _,
+            Height: 1080 as _,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as _,
+            CPUAccessFlags: 0,
+            ..Default::default()
+        };
+
+        let subresource_data = D3D11_SUBRESOURCE_DATA {
+            pSysMem: bytes.as_ptr() as _,
+            SysMemPitch: (1920 * 4) as u32,
+            SysMemSlicePitch: 0,
+        };
+
+        let mut tex = None;
+        unsafe {
+            device.CreateTexture2D(
+                &desc,
+                Some(&subresource_data),
+                Some(&mut tex),
+            )
+        }
+        .unwrap();
+
+        let tex = tex.unwrap();
+        let id = egui_renderer.register_native_texture(tex);
+
         Self {
             device,
             device_context,
@@ -134,7 +136,7 @@ impl App for DemoApp {
             egui_ctx,
             egui_renderer,
             egui_winit,
-            state: DemoState::default(),
+            tex: id,
         }
     }
 
@@ -148,6 +150,10 @@ impl App for DemoApp {
             }
         }
     }
+
+    fn on_exit(&mut self) {
+        self.egui_renderer.remove_native_texture(&self.tex);
+    }
 }
 
 impl DemoApp {
@@ -155,7 +161,14 @@ impl DemoApp {
         if let Some(render_target) = &self.render_target {
             let egui_input = self.egui_winit.take_egui_input(window);
             let egui_output = self.egui_ctx.run(egui_input, |ctx| {
-                self.state.ui(&ctx);
+                CentralPanel::default().show(ctx, |ui| {
+                    let image = Image::from_texture((
+                        self.tex,
+                        Vec2::new(1920.0, 1080.0),
+                    ))
+                    .shrink_to_fit();
+                    ui.add(image);
+                });
             });
             let (renderer_output, platform_output, _) =
                 egui_directx11::split_output(egui_output);
@@ -356,5 +369,9 @@ impl<T: App> ApplicationHandler for AppRunner<T> {
                 }
             }
         }
+    }
+
+    fn exiting(&mut self, _: &ActiveEventLoop) {
+        T::on_exit(self.app.as_mut().unwrap());
     }
 }

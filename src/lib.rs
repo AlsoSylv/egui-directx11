@@ -34,7 +34,7 @@ const fn zeroed<T>() -> T {
 }
 
 use egui::{
-    ClippedPrimitive, Pos2,
+    ClippedPrimitive, Pos2, TextureId,
     epaint::{ClippedShape, Primitive, Vertex, textures::TexturesDelta},
 };
 
@@ -294,6 +294,22 @@ impl Renderer {
         Ok(())
     }
 
+    /// Register a Texture2D for use in egui
+    pub fn register_native_texture(
+        &mut self,
+        texture: ID3D11Texture2D,
+    ) -> TextureId {
+        self.texture_pool.register_native_texture(texture)
+    }
+
+    /// Remove the texture from use in egui, likely to delete it entirely
+    pub fn remove_native_texture(
+        &mut self,
+        tid: &TextureId,
+    ) -> Option<ID3D11Texture2D> {
+        self.texture_pool.remove_native_texture(tid)
+    }
+
     fn setup(
         &mut self,
         ctx: &ID3D11DeviceContext,
@@ -349,6 +365,7 @@ impl Renderer {
                 device_context.PSSetShaderResources(0, Some(&[Some(srv)]))
             };
         } else {
+            println!("A");
             log::warn!(
                 concat!(
                     "egui wants to sample a non-existing texture {:?}.",

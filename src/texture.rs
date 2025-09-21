@@ -13,7 +13,11 @@ use std::{collections::HashMap, mem, slice};
 use egui::{Color32, ImageData, TextureId, TexturesDelta};
 
 use windows::{
-    Win32::Graphics::{Direct3D11::*, Dxgi::Common::*},
+    Win32::Graphics::{
+        Direct3D::{D3D_SRV_DIMENSION, D3D11_SRV_DIMENSION_TEXTURE2D},
+        Direct3D11::*,
+        Dxgi::Common::*,
+    },
     core::Result,
 };
 
@@ -26,7 +30,8 @@ struct Texture {
 
 pub struct TexturePool {
     device: ID3D11Device,
-    pool: HashMap<TextureId, Texture>,
+    pool: HashMap<u64, Texture>,
+    native_pool: HashMap<u64, ID3D11Texture2D>,
 }
 
 impl TexturePool {
@@ -34,11 +39,40 @@ impl TexturePool {
         Self {
             device: device.clone(),
             pool: HashMap::new(),
+            native_pool: HashMap::new(),
         }
     }
 
     pub fn get_srv(&self, tid: TextureId) -> Option<ID3D11ShaderResourceView> {
-        self.pool.get(&tid).map(|t| t.srv.clone())
+        match tid {
+            TextureId::Managed(tid) => {
+                self.pool.get(&tid).map(|t| t.srv.clone())
+            },
+            TextureId::User(tid) => {
+                let tex = self.native_pool.get(&tid)?;
+                let mut srv = None;
+                unsafe {
+                    self.device.CreateShaderResourceView(
+                        tex,
+                        Some(&D3D11_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            ViewDimension: D3D_SRV_DIMENSION {
+                                0: D3D11_SRV_DIMENSION_TEXTURE2D.0,
+                            },
+                            Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Texture2D: D3D11_TEX2D_SRV {
+                                    MipLevels: 1,
+                                    MostDetailedMip: 0,
+                                },
+                            },
+                        }),
+                        Some(&mut srv),
+                    )
+                }
+                .unwrap();
+                srv
+            },
+        }
     }
 
     pub fn update(
@@ -46,34 +80,56 @@ impl TexturePool {
         ctx: &ID3D11DeviceContext,
         delta: TexturesDelta,
     ) -> Result<()> {
-        for (tid, delta) in delta.set {
-            if delta.is_whole()
-                && delta.image.width() > 0
-                && delta.image.height() > 0
-            {
-                self.pool.insert(
-                    tid,
-                    Self::create_texture(&self.device, delta.image)?,
-                );
-                // the old texture is returned and dropped here, freeing
-                // all its gpu resource.
-            } else if let Some(tex) = self.pool.get_mut(&tid) {
-                Self::update_partial(
-                    ctx,
-                    tex,
-                    delta.image,
-                    delta.pos.unwrap(),
-                )?;
+        for (tid, delta) in
+            delta.set.into_iter().filter_map(|(tid, delta)| match tid {
+                TextureId::Managed(id) => Some((id, delta)),
+                TextureId::User(_) => None,
+            })
+        {
+            if let Some(pos) = delta.pos {
+                if let Some(tex) = self.pool.get_mut(&tid) {
+                    Self::update_partial(ctx, tex, delta.image, pos)?;
+                } else {
+                    log::warn!(
+                        "egui wants to update a non-existing texture {tid:?}. this request will be ignored."
+                    );
+                }
             } else {
-                log::warn!(
-                    "egui wants to update a non-existing texture {tid:?}. this request will be ignored."
-                );
+                if delta.image.width() > 0 && delta.image.height() > 0 {
+                    self.pool.insert(
+                        tid,
+                        Self::create_texture(&self.device, delta.image)?,
+                    );
+                }
             }
         }
         for tid in delta.free {
-            self.pool.remove(&tid);
+            if let TextureId::Managed(tid) = tid {
+                self.pool.remove(&tid);
+            }
         }
         Ok(())
+    }
+
+    pub fn register_native_texture(
+        &mut self,
+        texture: ID3D11Texture2D,
+    ) -> TextureId {
+        let id = self.native_pool.len() as u64;
+        self.native_pool.insert(id, texture);
+        TextureId::User(id)
+    }
+
+    pub fn remove_native_texture(
+        &mut self,
+        tid: &TextureId,
+    ) -> Option<ID3D11Texture2D> {
+        match tid {
+            TextureId::Managed(_) => {
+                panic!("Cannot manually remove managed textures")
+            },
+            TextureId::User(tid) => self.native_pool.remove(tid),
+        }
     }
 
     fn update_partial(
